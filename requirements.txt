@@ -1,0 +1,3 @@
+
+# Install runtime and development dependencies
+-e .[dev]

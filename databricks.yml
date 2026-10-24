@@ -1,0 +1,88 @@
+
+# ============================================================
+# PROJECT 11 - EARTHQUAKES
+# SEISMIC INTELLIGENCE LAKEHOUSE
+# Databricks Declarative Automation Bundles
+# ============================================================
+
+bundle:
+  name: project_11_earthquakes
+
+# ============================================================
+# ENVIRONMENT VARIABLES
+# ============================================================
+
+variables:
+
+  environment:
+    description: Deployment environment
+    default: dev
+
+  catalog:
+    description: Unity Catalog catalog
+    default: seismic_dev
+
+  bronze_schema:
+    description: Bronze layer schema
+    default: bronze
+
+  silver_schema:
+    description: Silver layer schema
+    default: silver
+
+  gold_schema:
+    description: Gold layer schema
+    default: gold
+
+  metadata_schema:
+    description: Metadata and control tables schema
+    default: metadata
+
+  quarantine_schema:
+    description: Invalid and rejected records schema
+    default: quarantine
+
+# ============================================================
+# DEPLOYMENT TARGETS
+# ============================================================
+
+targets:
+
+  # ----------------------------------------------------------
+  # DEVELOPMENT
+  # ----------------------------------------------------------
+
+  dev:
+    default: true
+    mode: development
+
+    variables:
+      environment: dev
+      catalog: seismic_dev
+
+  # ----------------------------------------------------------
+  # TESTING
+  # ----------------------------------------------------------
+
+  test:
+    mode: development
+
+    presets:
+      name_prefix: "[test]"
+
+    variables:
+      environment: test
+      catalog: seismic_test
+
+  # ----------------------------------------------------------
+  # PRODUCTION
+  # ----------------------------------------------------------
+
+  prod:
+
+    variables:
+      environment: prod
+      catalog: seismic_prod
+
+    # Production mode and deployment identity will be
+    # configured when we implement secured CI/CD deployment.
