@@ -37,14 +37,7 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
-namespaces = true
-include = [
-    "common*",
-    "history*",
-    "ingestion*",
-    "quality*",
-    "transformations*"
-]
+include = ["seismic_intelligence*"]
 
 # ============================================================
 # PYTEST CONFIGURATION
