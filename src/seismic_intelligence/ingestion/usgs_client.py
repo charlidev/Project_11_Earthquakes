@@ -1,8 +1,8 @@
 """
 USGS Earthquake API Client.
 
-Responsible for HTTP communication, request validation,
-timeouts, retries and GeoJSON response retrieval.
+Handles HTTP requests, retries, earthquake counts,
+pagination and incremental update filters.
 """
 
 import time
@@ -11,9 +11,18 @@ from typing import Any
 
 import requests
 
-BASE_URL = "https://earthquake.usgs.gov/fdsnws/event/1/query"
+BASE_URL = "https://earthquake.usgs.gov/fdsnws/event/1"
+QUERY_URL = f"{BASE_URL}/query"
+COUNT_URL = f"{BASE_URL}/count"
 
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+
+VALID_ORDER_OPTIONS = {
+    "time",
+    "time-asc",
+    "magnitude",
+    "magnitude-asc",
+}
 
 
 class USGSAPIError(Exception):
@@ -21,8 +30,6 @@ class USGSAPIError(Exception):
 
 
 class USGSEarthquakeClient:
-    """Client for the USGS Earthquake Catalog API."""
-
     def __init__(
         self,
         timeout: int = 30,
@@ -37,29 +44,35 @@ class USGSEarthquakeClient:
 
         self.session = session or requests.Session()
 
-        self.session.headers.update({"User-Agent": "Project_11_Earthquakes/0.1"})
+        self.session.headers.update({"User-Agent": "Project_11_Earthquakes/0.2"})
 
     @staticmethod
     def _format_datetime(value: datetime) -> str:
-        """Convert timezone-aware datetime to UTC ISO format."""
 
         if value.tzinfo is None:
             raise ValueError("Datetime must include timezone information.")
 
-        return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+        return (
+            value.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "")
+        )
 
-    def _request(self, params: dict[str, Any]) -> dict[str, Any]:
+    def _request(
+        self,
+        url: str,
+        params: dict[str, Any],
+    ) -> requests.Response:
 
         for attempt in range(self.max_retries + 1):
             try:
-                response = self.session.get(BASE_URL, params=params, timeout=self.timeout)
+                response = self.session.get(
+                    url,
+                    params=params,
+                    timeout=self.timeout,
+                )
 
                 if response.status_code in RETRYABLE_STATUS_CODES:
                     if attempt >= self.max_retries:
-                        raise USGSAPIError(
-                            f"USGS API failed after {attempt + 1} attempts. "
-                            f"HTTP {response.status_code}"
-                        )
+                        raise USGSAPIError(f"Maximum retries exceeded. HTTP {response.status_code}")
 
                     retry_after = response.headers.get("Retry-After")
 
@@ -73,19 +86,15 @@ class USGSEarthquakeClient:
                     time.sleep(wait_time)
                     continue
 
-                response.raise_for_status()
+                if response.status_code != 204:
+                    response.raise_for_status()
 
-                payload = response.json()
-
-                if payload.get("type") != "FeatureCollection":
-                    raise USGSAPIError("Unexpected USGS response structure.")
-
-                return payload
+                return response
 
             except (requests.Timeout, requests.ConnectionError) as error:
                 if attempt >= self.max_retries:
                     raise USGSAPIError(
-                        f"USGS connection failed after {attempt + 1} attempts: {error}"
+                        f"Connection failed after {attempt + 1} attempts: {error}"
                     ) from error
 
                 wait_time = self.backoff_factor * (2**attempt)
@@ -97,7 +106,67 @@ class USGSEarthquakeClient:
             except requests.HTTPError as error:
                 raise USGSAPIError(f"USGS HTTP request failed: {error}") from error
 
-        raise USGSAPIError("Maximum number of retries exceeded.")
+        raise USGSAPIError("Request failed.")
+
+    def _build_filters(
+        self,
+        starttime: datetime,
+        endtime: datetime,
+        min_magnitude: float = 2.5,
+        updatedafter: datetime | None = None,
+        include_deleted: bool = False,
+        bbox: dict[str, float] | None = None,
+    ) -> dict[str, Any]:
+
+        if starttime >= endtime:
+            raise ValueError("starttime must be earlier than endtime.")
+
+        params = {
+            "starttime": self._format_datetime(starttime),
+            "endtime": self._format_datetime(endtime),
+            "minmagnitude": min_magnitude,
+            "eventtype": "earthquake",
+        }
+
+        if updatedafter is not None:
+            params["updatedafter"] = self._format_datetime(updatedafter)
+
+        if include_deleted:
+            params["includedeleted"] = "true"
+
+        if bbox:
+            params.update(bbox)
+
+        return params
+
+    def count_earthquakes(
+        self,
+        starttime: datetime,
+        endtime: datetime,
+        min_magnitude: float = 2.5,
+        updatedafter: datetime | None = None,
+    ) -> int:
+        """Return the number of events matching the specified filters."""
+
+        params = self._build_filters(
+            starttime,
+            endtime,
+            min_magnitude,
+            updatedafter,
+        )
+
+        params["format"] = "text"
+
+        response = self._request(COUNT_URL, params)
+
+        if response.status_code == 204:
+            return 0
+
+        try:
+            return int(response.text.strip())
+
+        except ValueError as error:
+            raise USGSAPIError(f"Unexpected count response: {response.text!r}") from error
 
     def get_earthquakes(
         self,
@@ -107,67 +176,60 @@ class USGSEarthquakeClient:
         max_magnitude: float | None = None,
         bbox: dict[str, float] | None = None,
         limit: int = 100,
-        offset: int | None = None,
+        offset: int = 1,
+        updatedafter: datetime | None = None,
+        include_deleted: bool = False,
+        orderby: str = "time-asc",
     ) -> dict[str, Any]:
-        """
-        Retrieve earthquake events within a specified period.
-
-        Parameters
-        ----------
-        starttime : datetime
-            Beginning of the query period.
-        endtime : datetime
-            End of the query period.
-        min_magnitude : float
-            Minimum earthquake magnitude.
-        max_magnitude : float, optional
-            Maximum earthquake magnitude.
-        bbox : dict, optional
-            Geographic bounding box.
-        limit : int
-            Maximum records returned (USGS limit: 20,000).
-        offset : int, optional
-            Starting record offset.
-        """
-
-        if starttime >= endtime:
-            raise ValueError("starttime must be earlier than endtime.")
+        """Retrieve a paginated GeoJSON response."""
 
         if not 1 <= limit <= 20000:
             raise ValueError("limit must be between 1 and 20,000.")
 
-        if min_magnitude < -2:
-            raise ValueError("Invalid minimum magnitude.")
+        if offset < 1:
+            raise ValueError("offset must start at 1.")
 
-        if max_magnitude is not None and max_magnitude < min_magnitude:
-            raise ValueError("max_magnitude must be >= min_magnitude.")
+        if orderby not in VALID_ORDER_OPTIONS:
+            raise ValueError(f"Invalid orderby value: {orderby}")
 
-        params = {
-            "format": "geojson",
-            "starttime": self._format_datetime(starttime),
-            "endtime": self._format_datetime(endtime),
-            "minmagnitude": min_magnitude,
-            "eventtype": "earthquake",
-            "orderby": "time",
-            "limit": limit,
-        }
+        params = self._build_filters(
+            starttime,
+            endtime,
+            min_magnitude,
+            updatedafter,
+            include_deleted,
+            bbox,
+        )
 
         if max_magnitude is not None:
             params["maxmagnitude"] = max_magnitude
 
-        if offset is not None:
-            if offset < 1:
-                raise ValueError("offset must be greater than or equal to 1.")
-            params["offset"] = offset
+        params.update(
+            {
+                "format": "geojson",
+                "limit": limit,
+                "offset": offset,
+                "orderby": orderby,
+            }
+        )
 
-        if bbox:
-            params.update(bbox)
+        response = self._request(QUERY_URL, params)
 
-        return self._request(params)
+        if response.status_code == 204:
+            return {
+                "type": "FeatureCollection",
+                "features": [],
+                "metadata": {"count": 0},
+            }
+
+        payload = response.json()
+
+        if payload.get("type") != "FeatureCollection":
+            raise USGSAPIError("Unexpected response: expected FeatureCollection.")
+
+        return payload
 
     def close(self) -> None:
-        """Close the underlying HTTP session."""
-
         self.session.close()
 
     def __enter__(self) -> "USGSEarthquakeClient":
