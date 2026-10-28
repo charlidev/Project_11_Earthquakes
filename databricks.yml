@@ -86,3 +86,6 @@ targets:
 
     # Production mode and deployment identity will be
     # configured when we implement secured CI/CD deployment.
+
+include:
+  - resources/jobs/bronze_ingestion.job.yml
