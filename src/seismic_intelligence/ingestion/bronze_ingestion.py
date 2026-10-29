@@ -1,16 +1,18 @@
 """
 Bronze Ingestion - Project 11 Earthquakes.
 
-Reads original USGS GeoJSON files from ADLS Gen2
-and prepares an auditable Bronze Delta dataset.
+Reads original USGS GeoJSON files from ADLS Gen2,
+validates records and persists versioned events
+into a managed Delta Lake table.
 
-Execution environment: Azure Databricks.
+Execution environment: Azure Databricks Serverless.
 """
 
 import argparse
 from datetime import datetime, timezone
 
-from pyspark.sql import SparkSession
+from delta.tables import DeltaTable
+from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 
 # ============================================================
@@ -30,12 +32,15 @@ DEFAULT_TARGET_TABLE = "seismic_dev.bronze.earthquake_events"
 # ============================================================
 
 
-def read_geojson_source(spark, source_path: str):
+def read_geojson_source(
+    spark: SparkSession,
+    source_path: str,
+) -> DataFrame:
     """
     Read original USGS GeoJSON FeatureCollections from ADLS.
 
     Only .geojson files are included.
-    JSON metadata and checkpoint files are excluded.
+    Checkpoints and manifest files are excluded.
     """
 
     source_df = (
@@ -54,12 +59,16 @@ def read_geojson_source(spark, source_path: str):
 # ============================================================
 
 
-def build_bronze_dataframe(source_df, batch_id: str):
+def build_bronze_dataframe(
+    source_df: DataFrame,
+    batch_id: str,
+) -> DataFrame:
     """
     Explode GeoJSON FeatureCollections.
 
-    Preserve original event information as a nested structure.
-    Add ingestion metadata without applying business rules.
+    Preserve the original event as JSON text.
+
+    Calculate SHA-256 to identify individual event versions.
     """
 
     events_df = source_df.select(
@@ -69,10 +78,18 @@ def build_bronze_dataframe(source_df, batch_id: str):
         F.col("_metadata.file_modification_time").alias("source_file_modified_at"),
     )
 
+    event_json = F.to_json(
+        F.col("event"),
+        {"ignoreNullFields": "false"},
+    )
+
     bronze_df = events_df.select(
-        F.col("event.id").alias("event_id"),
-        # Preserve the complete original GeoJSON Feature.
-        F.col("event").alias("event_payload"),
+        # Business identifier.
+        F.col("event.id").cast("string").alias("event_id"),
+        # Original GeoJSON Feature.
+        event_json.alias("event_payload"),
+        # Event version identifier.
+        F.sha2(event_json, 256).alias("payload_hash"),
         # Source traceability.
         F.col("source_file"),
         F.col("source_file_name"),
@@ -92,32 +109,48 @@ def build_bronze_dataframe(source_df, batch_id: str):
 # ============================================================
 
 
-def validate_bronze_dataframe(df):
-    """Validate the Bronze dataset before persistence."""
+def validate_bronze_dataframe(df: DataFrame) -> int:
+    """
+    Validate incoming Bronze records before persistence.
 
-    if df.isEmpty():
+    Repeated event IDs are allowed when their payload hashes
+    differ, because they represent different event versions.
+    """
+
+    if df.limit(1).count() == 0:
         raise ValueError("No earthquake events were found.")
 
     total_records = df.count()
 
     missing_ids = df.filter(F.col("event_id").isNull() | (F.trim(F.col("event_id")) == "")).count()
 
-    duplicate_ids = df.groupBy("event_id").count().filter(F.col("count") > 1).count()
+    missing_hashes = df.filter(F.col("payload_hash").isNull()).count()
+
+    duplicate_versions = (
+        df.groupBy("event_id", "payload_hash").count().filter(F.col("count") > 1).count()
+    )
+
+    unique_event_ids = df.select("event_id").distinct().count()
 
     source_files = df.select("source_file").distinct().count()
 
     print("\n========== BRONZE VALIDATION ==========")
 
     print(f"Total records: {total_records:,}")
+    print(f"Unique event IDs: {unique_event_ids:,}")
     print(f"Source files: {source_files:,}")
     print(f"Missing event IDs: {missing_ids:,}")
-    print(f"Duplicate event IDs: {duplicate_ids:,}")
+    print(f"Missing payload hashes: {missing_hashes:,}")
+    print(f"Duplicate event versions: {duplicate_versions:,}")
 
     if missing_ids > 0:
         raise ValueError("Bronze validation failed: missing event IDs.")
 
-    if duplicate_ids > 0:
-        raise ValueError("Bronze validation failed: duplicate event IDs.")
+    if missing_hashes > 0:
+        raise ValueError("Bronze validation failed: missing payload hashes.")
+
+    if duplicate_versions > 0:
+        raise ValueError("Bronze validation failed: duplicate event versions.")
 
     return total_records
 
@@ -127,17 +160,50 @@ def validate_bronze_dataframe(df):
 # ============================================================
 
 
-def write_bronze_table(df, target_table: str):
+def write_bronze_table(
+    spark: SparkSession,
+    df: DataFrame,
+    target_table: str,
+) -> None:
     """
-    Persist the validated DataFrame as a managed Delta table.
+    Persist Bronze records as a managed Delta table.
 
-    This initial implementation uses append mode.
-    Idempotent incremental writes will be implemented later.
+    Initial execution:
+        Create the Delta table.
+
+    Subsequent executions:
+        Insert only event versions not already present.
+
+    Existing historical versions are never overwritten.
     """
 
-    (df.write.format("delta").mode("append").saveAsTable(target_table))
+    if not spark.catalog.tableExists(target_table):
+        (df.write.format("delta").mode("errorifexists").saveAsTable(target_table))
 
-    print(f"Bronze table written: {target_table}")
+        print(f"Initial Delta table created: {target_table}")
+
+    else:
+        delta_table = DeltaTable.forName(
+            spark,
+            target_table,
+        )
+
+        (
+            delta_table.alias("target")
+            .merge(
+                df.alias("source"),
+                """
+                target.event_id = source.event_id
+                AND target.payload_hash = source.payload_hash
+                """,
+            )
+            .whenNotMatchedInsertAll()
+            .execute()
+        )
+
+        print(f"Idempotent MERGE completed: {target_table}")
+
+    print(f"Bronze table persisted: {target_table}")
 
 
 # ============================================================
@@ -145,9 +211,9 @@ def write_bronze_table(df, target_table: str):
 # ============================================================
 
 
-def main():
+def main() -> None:
 
-    parser = argparse.ArgumentParser(description="USGS Bronze ingestion")
+    parser = argparse.ArgumentParser(description="USGS Bronze ingestion.")
 
     parser.add_argument(
         "--source-path",
@@ -162,7 +228,7 @@ def main():
     parser.add_argument(
         "--write",
         action="store_true",
-        help="Persist the validated data into Delta.",
+        help="Persist validated records into Delta.",
     )
 
     args = parser.parse_args()
@@ -171,6 +237,12 @@ def main():
 
     spark = SparkSession.builder.getOrCreate()
 
+    # Standardize timestamp handling.
+    spark.conf.set(
+        "spark.sql.session.timeZone",
+        "UTC",
+    )
+
     print("\n========== BRONZE INGESTION ==========")
 
     print("Source:", args.source_path)
@@ -178,35 +250,54 @@ def main():
     print("Batch ID:", batch_id)
     print("Write enabled:", args.write)
 
-    # Read source files.
+    # --------------------------------------------------------
+    # READ SOURCE
+    # --------------------------------------------------------
+
     source_df = read_geojson_source(
         spark,
         args.source_path,
     )
 
-    # Transform into Bronze structure.
+    # --------------------------------------------------------
+    # BUILD BRONZE DATAFRAME
+    # --------------------------------------------------------
+
     bronze_df = build_bronze_dataframe(
         source_df,
         batch_id,
     )
 
-    # Validate.
+    # --------------------------------------------------------
+    # VALIDATE
+    # --------------------------------------------------------
+
     total_records = validate_bronze_dataframe(bronze_df)
 
     print("\n========== BRONZE SCHEMA ==========")
+
     bronze_df.printSchema()
 
     print("\n========== SAMPLE RECORDS ==========")
 
     bronze_df.select(
         "event_id",
+        "payload_hash",
         "source_file_name",
+        "ingestion_batch_id",
         "ingested_at_utc",
-    ).show(10, truncate=False)
+    ).show(
+        10,
+        truncate=False,
+    )
 
-    # Persist only when explicitly requested.
+    # --------------------------------------------------------
+    # PERSISTENCE
+    # --------------------------------------------------------
+
     if args.write:
         write_bronze_table(
+            spark,
             bronze_df,
             args.target_table,
         )
@@ -215,7 +306,12 @@ def main():
         print("\nValidation-only execution.")
         print("No Delta table was modified.")
 
+    # --------------------------------------------------------
+    # EXECUTION SUMMARY
+    # --------------------------------------------------------
+
     print("\n========== EXECUTION SUMMARY ==========")
+
     print(f"Records processed: {total_records:,}")
     print("Execution completed successfully.")
 

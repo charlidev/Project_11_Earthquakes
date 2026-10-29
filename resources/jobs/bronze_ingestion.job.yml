@@ -7,7 +7,7 @@ resources:
       max_concurrent_runs: 1
 
       tasks:
-        - task_key: validate_bronze_ingestion
+        - task_key: write_bronze_ingestion
 
           spark_python_task:
             python_file: ../../src/seismic_intelligence/ingestion/bronze_ingestion.py
@@ -17,6 +17,7 @@ resources:
               - "abfss://seismic-dev@rgseismic.dfs.core.windows.net/landing/usgs/historical/2026-09-01_2026-09-30/"
               - "--target-table"
               - "seismic_dev.bronze.earthquake_events"
+              - "--write"
 
           environment_key: default
 
